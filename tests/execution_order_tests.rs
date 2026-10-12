@@ -17,9 +17,11 @@ impl ExecutionOrderTest {
     fn new() -> Self {
         let tempdir = tempdir().unwrap();
         let logfile_path = tempdir.path().join("output.log");
+        let mut cmd = hyperfine();
+        cmd.arg("-S");
 
         ExecutionOrderTest {
-            cmd: hyperfine(),
+            cmd,
             expected_content: String::new(),
             logfile_path,
             tempdir,
@@ -51,6 +53,11 @@ impl ExecutionOrderTest {
 
     fn prepare(&mut self, output: &str) -> &mut Self {
         self.arg("--prepare");
+        self.command(output)
+    }
+
+    fn conclude(&mut self, output: &str) -> &mut Self {
+        self.arg("--conclude");
         self.command(output)
     }
 
@@ -161,6 +168,24 @@ fn prepare_commands_are_executed_before_each_timing_run() {
 }
 
 #[test]
+fn conclude_commands_are_executed_after_each_timing_run() {
+    ExecutionOrderTest::new()
+        .arg("--runs=2")
+        .conclude("conclude")
+        .command("command 1")
+        .command("command 2")
+        .expect_output("command 1")
+        .expect_output("conclude")
+        .expect_output("command 1")
+        .expect_output("conclude")
+        .expect_output("command 2")
+        .expect_output("conclude")
+        .expect_output("command 2")
+        .expect_output("conclude")
+        .run();
+}
+
+#[test]
 fn prepare_commands_are_executed_before_each_warmup() {
     ExecutionOrderTest::new()
         .arg("--warmup=2")
@@ -184,6 +209,33 @@ fn prepare_commands_are_executed_before_each_warmup() {
         // benchmark 2
         .expect_output("prepare")
         .expect_output("command 2")
+        .run();
+}
+
+#[test]
+fn conclude_commands_are_executed_after_each_warmup() {
+    ExecutionOrderTest::new()
+        .arg("--warmup=2")
+        .arg("--runs=1")
+        .conclude("conclude")
+        .command("command 1")
+        .command("command 2")
+        // warmup 1
+        .expect_output("command 1")
+        .expect_output("conclude")
+        .expect_output("command 1")
+        .expect_output("conclude")
+        // benchmark 1
+        .expect_output("command 1")
+        .expect_output("conclude")
+        // warmup 2
+        .expect_output("command 2")
+        .expect_output("conclude")
+        .expect_output("command 2")
+        .expect_output("conclude")
+        // benchmark 2
+        .expect_output("command 2")
+        .expect_output("conclude")
         .run();
 }
 
@@ -235,6 +287,44 @@ fn setup_prepare_cleanup_combined() {
 }
 
 #[test]
+fn setup_prepare_conclude_cleanup_combined() {
+    ExecutionOrderTest::new()
+        .arg("--warmup=1")
+        .arg("--runs=2")
+        .setup("setup")
+        .prepare("prepare")
+        .command("command1")
+        .command("command2")
+        .conclude("conclude")
+        .cleanup("cleanup")
+        // 1
+        .expect_output("setup")
+        .expect_output("prepare")
+        .expect_output("command1")
+        .expect_output("conclude")
+        .expect_output("prepare")
+        .expect_output("command1")
+        .expect_output("conclude")
+        .expect_output("prepare")
+        .expect_output("command1")
+        .expect_output("conclude")
+        .expect_output("cleanup")
+        // 2
+        .expect_output("setup")
+        .expect_output("prepare")
+        .expect_output("command2")
+        .expect_output("conclude")
+        .expect_output("prepare")
+        .expect_output("command2")
+        .expect_output("conclude")
+        .expect_output("prepare")
+        .expect_output("command2")
+        .expect_output("conclude")
+        .expect_output("cleanup")
+        .run();
+}
+
+#[test]
 fn single_parameter_value() {
     ExecutionOrderTest::new()
         .arg("--runs=2")
@@ -274,5 +364,177 @@ fn multiple_parameter_values() {
         .expect_output("command 2 b")
         .expect_output("command 3 b")
         .expect_output("command 3 b")
+        .run();
+}
+
+#[test]
+fn commands_execute_in_input_order() {
+    ExecutionOrderTest::new()
+        .arg("--runs=1")
+        .command("reference")
+        .command("command 1")
+        .command("command 2")
+        .expect_output("reference")
+        .expect_output("command 1")
+        .expect_output("command 2")
+        .run();
+}
+
+#[test]
+fn repeated_commands_execute_separately() {
+    ExecutionOrderTest::new()
+        .arg("--runs=1")
+        .command("command 1")
+        .command("command 1")
+        .command("command 2")
+        .expect_output("command 1")
+        .expect_output("command 1")
+        .expect_output("command 2")
+        .run();
+}
+
+#[test]
+fn setup_prepare_reference_conclude_cleanup_combined() {
+    ExecutionOrderTest::new()
+        .arg("--warmup=1")
+        .arg("--runs=2")
+        .setup("setup")
+        .prepare("prepare")
+        .command("reference")
+        .command("command1")
+        .command("command2")
+        .conclude("conclude")
+        .cleanup("cleanup")
+        // reference
+        .expect_output("setup")
+        .expect_output("prepare")
+        .expect_output("reference")
+        .expect_output("conclude")
+        .expect_output("prepare")
+        .expect_output("reference")
+        .expect_output("conclude")
+        .expect_output("prepare")
+        .expect_output("reference")
+        .expect_output("conclude")
+        .expect_output("cleanup")
+        // 1
+        .expect_output("setup")
+        .expect_output("prepare")
+        .expect_output("command1")
+        .expect_output("conclude")
+        .expect_output("prepare")
+        .expect_output("command1")
+        .expect_output("conclude")
+        .expect_output("prepare")
+        .expect_output("command1")
+        .expect_output("conclude")
+        .expect_output("cleanup")
+        // 2
+        .expect_output("setup")
+        .expect_output("prepare")
+        .expect_output("command2")
+        .expect_output("conclude")
+        .expect_output("prepare")
+        .expect_output("command2")
+        .expect_output("conclude")
+        .expect_output("prepare")
+        .expect_output("command2")
+        .expect_output("conclude")
+        .expect_output("cleanup")
+        .run();
+}
+
+#[test]
+fn setup_separate_prepare_separate_conclude_cleanup_combined() {
+    ExecutionOrderTest::new()
+        .arg("--warmup=1")
+        .arg("--runs=2")
+        .setup("setup")
+        .cleanup("cleanup")
+        .prepare("prepare1")
+        .command("command1")
+        .conclude("conclude1")
+        .prepare("prepare2")
+        .command("command2")
+        .conclude("conclude2")
+        // 1
+        .expect_output("setup")
+        .expect_output("prepare1")
+        .expect_output("command1")
+        .expect_output("conclude1")
+        .expect_output("prepare1")
+        .expect_output("command1")
+        .expect_output("conclude1")
+        .expect_output("prepare1")
+        .expect_output("command1")
+        .expect_output("conclude1")
+        .expect_output("cleanup")
+        // 2
+        .expect_output("setup")
+        .expect_output("prepare2")
+        .expect_output("command2")
+        .expect_output("conclude2")
+        .expect_output("prepare2")
+        .expect_output("command2")
+        .expect_output("conclude2")
+        .expect_output("prepare2")
+        .expect_output("command2")
+        .expect_output("conclude2")
+        .expect_output("cleanup")
+        .run();
+}
+
+#[test]
+fn setup_separate_prepare_reference_separate_conclude_cleanup_combined() {
+    ExecutionOrderTest::new()
+        .arg("--warmup=1")
+        .arg("--runs=2")
+        .setup("setup")
+        .cleanup("cleanup")
+        .prepare("prepareref")
+        .command("reference")
+        .conclude("concluderef")
+        .prepare("prepare1")
+        .command("command1")
+        .conclude("conclude1")
+        .prepare("prepare2")
+        .command("command2")
+        .conclude("conclude2")
+        // reference
+        .expect_output("setup")
+        .expect_output("prepareref")
+        .expect_output("reference")
+        .expect_output("concluderef")
+        .expect_output("prepareref")
+        .expect_output("reference")
+        .expect_output("concluderef")
+        .expect_output("prepareref")
+        .expect_output("reference")
+        .expect_output("concluderef")
+        .expect_output("cleanup")
+        // 1
+        .expect_output("setup")
+        .expect_output("prepare1")
+        .expect_output("command1")
+        .expect_output("conclude1")
+        .expect_output("prepare1")
+        .expect_output("command1")
+        .expect_output("conclude1")
+        .expect_output("prepare1")
+        .expect_output("command1")
+        .expect_output("conclude1")
+        .expect_output("cleanup")
+        // 2
+        .expect_output("setup")
+        .expect_output("prepare2")
+        .expect_output("command2")
+        .expect_output("conclude2")
+        .expect_output("prepare2")
+        .expect_output("command2")
+        .expect_output("conclude2")
+        .expect_output("prepare2")
+        .expect_output("command2")
+        .expect_output("conclude2")
+        .expect_output("cleanup")
         .run();
 }

@@ -1,15 +1,16 @@
 use std::fs::File;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::{cmp, env, fmt, io};
 
 use anyhow::ensure;
-use atty::Stream;
 use clap::ArgMatches;
 
 use crate::command::Commands;
 use crate::error::OptionsError;
-use crate::util::units::{Second, Unit};
+use crate::metric::{Metric, MetricSelection};
+use crate::quantity::{second, Time};
 
 use anyhow::Result;
 
@@ -29,22 +30,21 @@ pub enum Shell {
     Custom(Vec<String>),
 }
 
-impl Default for Shell {
-    fn default() -> Self {
-        Shell::Default(DEFAULT_SHELL)
-    }
-}
-
 impl fmt::Display for Shell {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Shell::Default(cmd) => write!(f, "{}", cmd),
+            Shell::Default(cmd) => write!(f, "{cmd}"),
             Shell::Custom(cmdline) => write!(f, "{}", shell_words::join(cmdline)),
         }
     }
 }
 
 impl Shell {
+    /// Select the platform shell (sh on Unix, cmd.exe on Windows).
+    pub fn platform_default() -> Self {
+        Shell::Default(DEFAULT_SHELL)
+    }
+
     /// Parse given string as shell command line
     pub fn parse_from_str<'a>(s: &str) -> Result<Self, OptionsError<'a>> {
         let v = shell_words::split(s).map_err(OptionsError::ShellParseError)?;
@@ -67,13 +67,16 @@ impl Shell {
 }
 
 /// Action to take when an executed command fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CmdFailureAction {
     /// Exit with an error message
     RaiseError,
 
-    /// Simply ignore the non-zero exit code
-    Ignore,
+    /// Ignore all non-zero exit codes
+    IgnoreAllFailures,
+
+    /// Ignore specific exit codes
+    IgnoreSpecificFailures(Vec<i32>),
 }
 
 /// Output style type option
@@ -110,10 +113,36 @@ impl Default for RunBounds {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq)]
+pub enum CommandInputPolicy {
+    /// Read from the null device
+    #[default]
+    Null,
+
+    /// Read input from a file
+    File(PathBuf),
+}
+
+impl CommandInputPolicy {
+    pub fn get_stdin(&self) -> io::Result<Stdio> {
+        let stream: Stdio = match self {
+            CommandInputPolicy::Null => Stdio::null(),
+
+            CommandInputPolicy::File(path) => {
+                let file: File = File::open(path)?;
+                Stdio::from(file)
+            }
+        };
+
+        Ok(stream)
+    }
+}
+
 /// How to handle the output of benchmarked commands
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CommandOutputPolicy {
     /// Redirect output to the null device
+    #[default]
     Null,
 
     /// Feed output through a pipe before discarding it
@@ -126,12 +155,6 @@ pub enum CommandOutputPolicy {
     Inherit,
 }
 
-impl Default for CommandOutputPolicy {
-    fn default() -> Self {
-        CommandOutputPolicy::Null
-    }
-}
-
 impl CommandOutputPolicy {
     pub fn get_stdout_stderr(&self) -> io::Result<(Stdio, Stdio)> {
         let streams = match self {
@@ -141,7 +164,7 @@ impl CommandOutputPolicy {
             CommandOutputPolicy::Pipe => (Stdio::piped(), Stdio::null()),
 
             CommandOutputPolicy::File(path) => {
-                let file = File::create(&path)?;
+                let file = File::create(path)?;
                 (file.into(), Stdio::null())
             }
 
@@ -152,16 +175,12 @@ impl CommandOutputPolicy {
     }
 }
 
+#[derive(Debug, Default, PartialEq)]
 pub enum ExecutorKind {
+    #[default]
     Raw,
     Shell(Shell),
     Mock(Option<String>),
-}
-
-impl Default for ExecutorKind {
-    fn default() -> Self {
-        ExecutorKind::Shell(Shell::default())
-    }
 }
 
 /// The main settings for a hyperfine benchmark session
@@ -173,18 +192,21 @@ pub struct Options {
     pub warmup_count: u64,
 
     /// Minimum benchmarking time
-    pub min_benchmarking_time: Second,
+    pub min_benchmarking_time: Time,
 
     /// Whether or not to ignore non-zero exit codes
     pub command_failure_action: CmdFailureAction,
 
-    /// Command(s) to run before each timing run
+    /// Command(s) to run before each benchmark run
     pub preparation_command: Option<Vec<String>>,
 
-    /// Command to run before each *batch* of timing runs, i.e. before each individual benchmark
+    /// Command(s) to run after each benchmark run
+    pub conclusion_command: Option<Vec<String>>,
+
+    /// Command to run before each *batch* of benchmark runs, i.e. before each individual benchmark
     pub setup_command: Option<String>,
 
-    /// Command to run after each *batch* of timing runs, i.e. after each individual benchmark
+    /// Command to run after each *batch* of benchmark runs, i.e. after each individual benchmark
     pub cleanup_command: Option<String>,
 
     /// What color mode to use for the terminal output
@@ -193,11 +215,17 @@ pub struct Options {
     /// Determines how we run commands
     pub executor_kind: ExecutorKind,
 
-    /// What to do with the output of the benchmarked command
-    pub command_output_policy: CommandOutputPolicy,
+    /// Where input to the benchmarked command comes from
+    pub command_input_policy: CommandInputPolicy,
 
-    /// Which time unit to use when displaying resuls
-    pub time_unit: Option<Unit>,
+    /// What to do with the output of the benchmarked commands
+    pub command_output_policies: Vec<CommandOutputPolicy>,
+
+    /// Displayed metrics, with the primary metric first.
+    pub metrics: Vec<MetricSelection>,
+
+    /// The `all` preset displays only metrics with complete measurements.
+    pub skip_unavailable_metrics: bool,
 }
 
 impl Default for Options {
@@ -205,15 +233,19 @@ impl Default for Options {
         Options {
             run_bounds: RunBounds::default(),
             warmup_count: 0,
-            min_benchmarking_time: 3.0,
+            min_benchmarking_time: Time::new::<second>(3.0),
             command_failure_action: CmdFailureAction::RaiseError,
             preparation_command: None,
+            conclusion_command: None,
             setup_command: None,
             cleanup_command: None,
             output_style: OutputStyleOption::Full,
             executor_kind: ExecutorKind::default(),
-            command_output_policy: CommandOutputPolicy::Null,
-            time_unit: None,
+            command_output_policies: vec![CommandOutputPolicy::Null],
+            metrics: MetricSelection::parse_list(crate::cli::DEFAULT_METRICS)
+                .expect("valid default metrics"),
+            skip_unavailable_metrics: false,
+            command_input_policy: CommandInputPolicy::Null,
         }
     }
 }
@@ -221,22 +253,15 @@ impl Default for Options {
 impl Options {
     pub fn from_cli_arguments<'a>(matches: &ArgMatches) -> Result<Self, OptionsError<'a>> {
         let mut options = Self::default();
-        let param_to_u64 = |param| {
-            matches
-                .value_of(param)
-                .map(|n| {
-                    n.parse::<u64>()
-                        .map_err(|e| OptionsError::IntParsingError(param, e))
-                })
-                .transpose()
-        };
+        options.warmup_count = matches
+            .get_one::<u64>("warmup")
+            .copied()
+            .unwrap_or(options.warmup_count);
 
-        options.warmup_count = param_to_u64("warmup")?.unwrap_or(options.warmup_count);
+        let mut min_runs = matches.get_one::<u64>("min-runs").copied();
+        let mut max_runs = matches.get_one::<u64>("max-runs").copied();
 
-        let mut min_runs = param_to_u64("min-runs")?;
-        let mut max_runs = param_to_u64("max-runs")?;
-
-        if let Some(runs) = param_to_u64("runs")? {
+        if let Some(&runs) = matches.get_one::<u64>("runs") {
             min_runs = Some(runs);
             max_runs = Some(runs);
         }
@@ -260,42 +285,53 @@ impl Options {
             (None, None) => {}
         };
 
-        options.setup_command = matches.value_of("setup").map(String::from);
+        options.setup_command = matches.get_one::<String>("setup").map(String::from);
 
         options.preparation_command = matches
-            .values_of("prepare")
+            .get_many::<String>("prepare")
             .map(|values| values.map(String::from).collect::<Vec<String>>());
 
-        options.cleanup_command = matches.value_of("cleanup").map(String::from);
+        options.conclusion_command = matches
+            .get_many::<String>("conclude")
+            .map(|values| values.map(String::from).collect::<Vec<String>>());
 
-        options.command_output_policy = if matches.is_present("show-output") {
-            CommandOutputPolicy::Inherit
-        } else if let Some(output) = matches.value_of("output") {
-            match output {
-                "null" => CommandOutputPolicy::Null,
-                "pipe" => CommandOutputPolicy::Pipe,
-                "inherit" => CommandOutputPolicy::Inherit,
-                arg => {
-                    let path = PathBuf::from(arg);
-                    if path.components().count() <= 1 {
-                        return Err(OptionsError::UnknownOutputPolicy(arg.to_string()));
+        options.cleanup_command = matches.get_one::<String>("cleanup").map(String::from);
+
+        options.command_output_policies = if matches.get_flag("show-output") {
+            vec![CommandOutputPolicy::Inherit]
+        } else if let Some(output_values) = matches.get_many::<String>("output") {
+            let mut policies = vec![];
+            for value in output_values {
+                let policy = match value.as_str() {
+                    "null" => CommandOutputPolicy::Null,
+                    "pipe" => CommandOutputPolicy::Pipe,
+                    "inherit" => CommandOutputPolicy::Inherit,
+                    arg => {
+                        let path = PathBuf::from(arg);
+                        if path.components().count() <= 1 {
+                            return Err(OptionsError::UnknownOutputPolicy(arg.to_string()));
+                        }
+                        CommandOutputPolicy::File(path)
                     }
-                    CommandOutputPolicy::File(path)
-                }
+                };
+                policies.push(policy);
             }
+            policies
         } else {
-            CommandOutputPolicy::Null
+            vec![CommandOutputPolicy::Null]
         };
 
-        options.output_style = match matches.value_of("style") {
+        options.output_style = match matches.get_one::<String>("style").map(|s| s.as_str()) {
             Some("full") => OutputStyleOption::Full,
             Some("basic") => OutputStyleOption::Basic,
             Some("nocolor") => OutputStyleOption::NoColor,
             Some("color") => OutputStyleOption::Color,
             Some("none") => OutputStyleOption::Disabled,
             _ => {
-                if options.command_output_policy == CommandOutputPolicy::Inherit
-                    || !atty::is(Stream::Stdout)
+                if options
+                    .command_output_policies
+                    .contains(&CommandOutputPolicy::Inherit)
+                    || !io::stdout().is_terminal()
                 {
                     OutputStyleOption::Basic
                 } else if env::var_os("TERM")
@@ -322,45 +358,134 @@ impl Options {
             OutputStyleOption::Disabled => {}
         };
 
-        options.executor_kind = if matches.is_present("no-shell") {
+        options.executor_kind = if matches.get_flag("no-shell") {
             ExecutorKind::Raw
+        } else if matches.get_flag("default-shell") {
+            ExecutorKind::Shell(Shell::platform_default())
         } else {
-            match (matches.is_present("debug-mode"), matches.value_of("shell")) {
-                (false, Some(shell)) if shell == "default" => ExecutorKind::Shell(Shell::default()),
+            match (
+                matches.get_flag("debug-mode"),
+                matches.get_one::<String>("shell"),
+            ) {
+                (false, Some(shell)) if shell == "default" => {
+                    ExecutorKind::Shell(Shell::platform_default())
+                }
                 (false, Some(shell)) if shell == "none" => ExecutorKind::Raw,
                 (false, Some(shell)) => ExecutorKind::Shell(Shell::parse_from_str(shell)?),
-                (false, None) => ExecutorKind::Shell(Shell::default()),
+                (false, None) => ExecutorKind::default(),
                 (true, Some(shell)) => ExecutorKind::Mock(Some(shell.into())),
                 (true, None) => ExecutorKind::Mock(None),
             }
         };
 
-        if matches.is_present("ignore-failure") {
-            options.command_failure_action = CmdFailureAction::Ignore;
+        if let Some(mode) = matches.get_one::<String>("ignore-failure") {
+            options.command_failure_action = match mode.as_str() {
+                "all-non-zero" | "" => CmdFailureAction::IgnoreAllFailures,
+                codes => {
+                    let exit_codes: Result<Vec<i32>, _> = codes
+                        .split(',')
+                        .map(|s| {
+                            s.trim()
+                                .parse::<i32>()
+                                .map_err(|e| OptionsError::IntParsingError("ignore-failure", e))
+                        })
+                        .collect();
+                    CmdFailureAction::IgnoreSpecificFailures(exit_codes?)
+                }
+            };
         }
 
-        options.time_unit = match matches.value_of("time-unit") {
-            Some("millisecond") => Some(Unit::MilliSecond),
-            Some("second") => Some(Unit::Second),
-            _ => None,
+        match matches.get_one::<String>("metrics").unwrap().as_str() {
+            "default" => {}
+            "time" => {
+                options.metrics = [
+                    Metric::TimeWallClock,
+                    Metric::TimeCpu,
+                    Metric::TimeUser,
+                    Metric::TimeSystem,
+                ]
+                .map(|metric| MetricSelection { metric, unit: None })
+                .to_vec();
+            }
+            "all" => {
+                let shell = matches!(
+                    options.executor_kind,
+                    ExecutorKind::Shell(_) | ExecutorKind::Mock(Some(_))
+                );
+                options.metrics = Metric::ALL
+                    .iter()
+                    .copied()
+                    .filter(|metric| metric.ensure_available(shell).is_ok())
+                    .map(|metric| MetricSelection { metric, unit: None })
+                    .collect();
+                options.skip_unavailable_metrics = true;
+            }
+            list => {
+                options.metrics = MetricSelection::parse_list(list)
+                    .map_err(|error| OptionsError::InvalidMetrics(error.to_string()))?;
+            }
+        }
+
+        if let Some(time) = matches.get_one::<String>("min-benchmarking-time") {
+            options.min_benchmarking_time = Time::new::<second>(
+                time.parse::<f64>()
+                    .map_err(|e| OptionsError::FloatParsingError("min-benchmarking-time", e))?,
+            );
+        }
+
+        options.command_input_policy = if let Some(path_str) = matches.get_one::<String>("input") {
+            if path_str == "null" {
+                CommandInputPolicy::Null
+            } else {
+                let path = PathBuf::from(path_str);
+                if !path.exists() {
+                    return Err(OptionsError::StdinDataFileDoesNotExist(
+                        path_str.to_string(),
+                    ));
+                }
+                CommandInputPolicy::File(path)
+            }
+        } else {
+            CommandInputPolicy::Null
         };
-
-        if let Some(time) = matches.value_of("min-benchmarking-time") {
-            options.min_benchmarking_time = time
-                .parse::<f64>()
-                .map_err(|e| OptionsError::FloatParsingError("min-benchmarking-time", e))?;
-        }
 
         Ok(options)
     }
 
-    pub fn validate_against_command_list(&self, commands: &Commands) -> Result<()> {
+    pub fn validate_against_command_list(&mut self, commands: &Commands) -> Result<()> {
+        if !matches!(self.executor_kind, ExecutorKind::Mock(_)) {
+            for selection in &self.metrics {
+                selection
+                    .metric
+                    .ensure_available(matches!(self.executor_kind, ExecutorKind::Shell(_)))?;
+            }
+        }
+        let num_commands = commands.num_commands();
+
         if let Some(preparation_command) = &self.preparation_command {
             ensure!(
-                preparation_command.len() <= 1
-                    || commands.num_commands() == preparation_command.len(),
-                "The '--prepare' option has to be provided just once or N times, where N is the \
-             number of benchmark commands."
+                preparation_command.len() <= 1 || num_commands == preparation_command.len(),
+                "The '--prepare' option has to be provided just once or N times, where N={num_commands} is the \
+                 number of benchmark commands."
+            );
+        }
+
+        if let Some(conclusion_command) = &self.conclusion_command {
+            ensure!(
+                conclusion_command.len() <= 1 || num_commands == conclusion_command.len(),
+                "The '--conclude' option has to be provided just once or N times, where N={num_commands} is the \
+                 number of benchmark commands."
+            );
+        }
+
+        if self.command_output_policies.len() == 1 {
+            self.command_output_policies =
+                vec![self.command_output_policies[0].clone(); num_commands];
+        } else {
+            ensure!(
+                self.command_output_policies.len() == num_commands,
+                "The '--output' option has to be provided just once or N times, where N={num_commands} is the \
+                 number of benchmark commands."
             );
         }
 
@@ -369,10 +494,10 @@ impl Options {
 }
 
 #[test]
-fn test_default_shell() {
-    let shell = Shell::default();
+fn test_platform_default_shell() {
+    let shell = Shell::platform_default();
 
-    let s = format!("{}", shell);
+    let s = format!("{shell}");
     assert_eq!(&s, DEFAULT_SHELL);
 
     let cmd = shell.command();
@@ -383,7 +508,7 @@ fn test_default_shell() {
 fn test_can_parse_shell_command_line_from_str() {
     let shell = Shell::parse_from_str("shell -x 'aaa bbb'").unwrap();
 
-    let s = format!("{}", shell);
+    let s = format!("{shell}");
     assert_eq!(&s, "shell -x 'aaa bbb'");
 
     let cmd = shell.command();

@@ -1,6 +1,17 @@
 use std::ffi::OsString;
 
-use clap::{crate_version, AppSettings, Arg, ArgMatches, Command};
+use clap::{
+    builder::styling::{AnsiColor, Effects},
+    builder::NonEmptyStringValueParser,
+    builder::Styles,
+    crate_version, Arg, ArgAction, ArgMatches, Command, ValueHint,
+};
+
+pub const DEFAULT_METRICS: &str = if cfg!(windows) {
+    "time_wall_clock"
+} else {
+    "time_wall_clock,memory_peak_resident"
+};
 
 pub fn get_cli_arguments<'a, I, T>(args: I) -> ArgMatches
 where
@@ -11,32 +22,82 @@ where
     command.get_matches_from(args)
 }
 
+const STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Cyan.on_default());
+
 /// Build the clap command for parsing command line arguments
-fn build_command() -> Command<'static> {
+fn build_command() -> Command {
     Command::new("hyperfine")
         .version(crate_version!())
-        .setting(AppSettings::DeriveDisplayOrder)
+        .styles(STYLES)
         .next_line_help(true)
         .hide_possible_values(true)
-        .max_term_width(90)
         .about("A command-line benchmarking tool.")
+        .help_expected(true)
+        .max_term_width(80)
         .arg(
             Arg::new("command")
                 .help("The command to benchmark. This can be the name of an executable, a command \
                        line like \"grep -i todo\" or a shell command like \"sleep 0.5 && echo test\". \
-                       The latter is only available if the shell is not explicitly disabled via \
-                       '--shell=none'. If multiple commands are given, hyperfine will show a \
-                       comparison of the respective runtimes.")
+                       The latter requires a shell, which can be enabled via '-S' or '--shell=...'. \
+                       If multiple commands are given, hyperfine will show a \
+                       comparison with the first command as the reference.")
                 .required(true)
-                .multiple_occurrences(true)
-                .forbid_empty_values(true),
+                .action(ArgAction::Append)
+                .value_hint(ValueHint::CommandString)
+                .value_parser(NonEmptyStringValueParser::new()),
+        )
+        // Retain the removed option to provide migration guidance for old invocations.
+        .arg(
+            Arg::new("reference")
+                .long("reference")
+                .hide(true)
+                .value_name("CMD")
+                .num_args(0..=1)
+                .default_missing_value("")
+                .value_parser(|_: &str| -> Result<String, String> {
+                    Err("The --reference option has been removed. Put your reference command first instead.".into())
+                })
+                .help("Removed: put your reference command first instead."),
+        )
+        .arg(
+            Arg::new("metrics")
+                .long("metrics")
+                .value_name("PRESET|METRIC[:UNIT],…")
+                .default_value("default")
+                .hide_default_value(true)
+                .help("Performance metrics to measure, in order.\n\n\
+                       This is either a preset name, or a comma-separated list of metrics with optional units. \
+                       CSV exports all selected metrics; markup exports use the first metric. \
+                       JSON always includes all collected metrics.\n\n\
+                       Presets (use one on its own):\n  \
+                         default  Wall-clock time and peak RSS\n  \
+                         time     Wall-clock, CPU, user, and system time\n  \
+                         all      All available metrics\n\n\
+                       Presets use automatic units.\n\n\
+                       Metrics and optional units:\n  \
+                         Time: time_wall_clock, time_cpu, time_user, time_system\n    \
+                           Units: ns, us, ms, s, min, h\n  \
+                         Memory: memory_peak_resident\n    \
+                           Units: B, kB, MB, GB, TB, KiB, MiB, GiB, TiB\n  \
+                         Counters: cpu_cycles, instructions, cache_references,\n    \
+                           cache_misses, branch_misses\n    \
+                           Units: count, k (thousand), M (million), B (billion)\n\n\
+                       Examples:\n  \
+                       --metrics time_cpu,instructions\n  \
+                       --metrics memory_peak_resident:MiB,time_wall_clock:ms\n  \
+                       --metrics time"),
         )
         .arg(
             Arg::new("warmup")
                 .long("warmup")
                 .short('w')
-                .takes_value(true)
                 .value_name("NUM")
+                .action(ArgAction::Set)
+                .value_parser(clap::value_parser!(u64))
                 .help(
                     "Perform NUM warmup runs before the actual benchmark. This can be used \
                      to fill (disk) caches for I/O-heavy programs.",
@@ -46,37 +107,62 @@ fn build_command() -> Command<'static> {
             Arg::new("min-runs")
                 .long("min-runs")
                 .short('m')
-                .takes_value(true)
+                .action(ArgAction::Set)
                 .value_name("NUM")
+                .value_parser(clap::value_parser!(u64).range(1..))
                 .help("Perform at least NUM runs for each command (default: 10)."),
         )
         .arg(
             Arg::new("max-runs")
                 .long("max-runs")
                 .short('M')
-                .takes_value(true)
+                .action(ArgAction::Set)
                 .value_name("NUM")
+                .value_parser(clap::value_parser!(u64).range(1..))
                 .help("Perform at most NUM runs for each command. By default, there is no limit."),
         )
         .arg(
             Arg::new("runs")
                 .long("runs")
-                .conflicts_with_all(&["max-runs", "min-runs"])
+                .conflicts_with_all(["max-runs", "min-runs"])
                 .short('r')
-                .takes_value(true)
+                .action(ArgAction::Set)
                 .value_name("NUM")
+                .value_parser(clap::value_parser!(u64).range(1..))
                 .help("Perform exactly NUM runs for each command. If this option is not specified, \
                        hyperfine automatically determines the number of runs."),
+        )
+        .arg(
+            Arg::new("env")
+                .long("env")
+                .action(ArgAction::Append)
+                .num_args(1)
+                .value_name("ASSIGNMENTS")
+                .help("Set environment variables for benchmark commands and their respective setup, \
+                       prepare, conclude, and cleanup commands. Assignments are space-separated and \
+                       support shell-style quoting, but no shell expansion:\n\n  \
+                       hyperfine \\\n    \
+                         --env 'OMP_NUM_THREADS=8 CFLAGS=\"-O3 -march=native\"' \\\n    \
+                         'my_command'\n\n\
+                       Specify once for all commands or once per benchmark command:\n\n  \
+                       hyperfine \\\n    \
+                         --env 'OMP_NUM_THREADS=8' './benchmark-cpp' \\\n    \
+                         --env 'RAYON_NUM_THREADS=8' './benchmark-rust'\n\n\
+                       Use an empty --env='' for no overrides. Values can contain parameter placeholders. \
+                       For example, the following benchmarks 'my_command' with OMP_NUM_THREADS ranging \
+                       from 1 to 8:\n\n  \
+                       hyperfine -P threads 1 8 \\\n    \
+                         --env 'OMP_NUM_THREADS={threads}' 'my_command'"),
         )
         .arg(
             Arg::new("setup")
                 .long("setup")
                 .short('s')
-                .takes_value(true)
-                .number_of_values(1)
+                .action(ArgAction::Set)
                 .value_name("CMD")
+                .value_hint(ValueHint::CommandString)
                 .help(
-                    "Execute CMD before each set of timing runs. This is useful for \
+                    "Execute CMD before each set of benchmark runs. This is useful for \
                      compiling your software with the provided parameters, or to do any \
                      other work that should happen once before a series of benchmark runs, \
                      not every time as would happen with the --prepare option."
@@ -86,12 +172,12 @@ fn build_command() -> Command<'static> {
             Arg::new("prepare")
                 .long("prepare")
                 .short('p')
-                .takes_value(true)
-                .multiple_occurrences(true)
-                .number_of_values(1)
+                .action(ArgAction::Append)
+                .num_args(1)
                 .value_name("CMD")
+                .value_hint(ValueHint::CommandString)
                 .help(
-                    "Execute CMD before each timing run. This is useful for \
+                    "Execute CMD before each benchmark run. This is useful for \
                      clearing disk caches, for example.\nThe --prepare option can \
                      be specified once for all commands or multiple times, once for \
                      each command. In the latter case, each preparation command will \
@@ -99,11 +185,29 @@ fn build_command() -> Command<'static> {
                 ),
         )
         .arg(
+            Arg::new("conclude")
+                .long("conclude")
+                .short('C')
+                .action(ArgAction::Append)
+                .num_args(1)
+                .value_name("CMD")
+                .value_hint(ValueHint::CommandString)
+                .help(
+                    "Execute CMD after each benchmark run. This is useful for killing \
+                     long-running processes started (e.g. a web server started in --prepare), \
+                     for example.\nThe --conclude option can be specified once for all \
+                     commands or multiple times, once for each command. In the latter case, \
+                     each conclude command will be run after the corresponding benchmark \
+                     command.",
+                ),
+        )
+        .arg(
             Arg::new("cleanup")
                 .long("cleanup")
                 .short('c')
-                .takes_value(true)
+                .action(ArgAction::Set)
                 .value_name("CMD")
+                .value_hint(ValueHint::CommandString)
                 .help(
                     "Execute CMD after the completion of all benchmarking \
                      runs for each individual command to be benchmarked. \
@@ -115,16 +219,16 @@ fn build_command() -> Command<'static> {
             Arg::new("parameter-scan")
                 .long("parameter-scan")
                 .short('P')
-                .takes_value(true)
+                .action(ArgAction::Set)
                 .allow_hyphen_values(true)
-                .value_names(&["VAR", "MIN", "MAX"])
+                .value_names(["VAR", "MIN", "MAX"])
                 .help(
                     "Perform benchmark runs for each value in the range MIN..MAX. Replaces the \
                      string '{VAR}' in each command by the current parameter value.\n\n  \
-                     Example:  hyperfine -P threads 1 8 'make -j {threads}'\n\n\
+                     Example:  hyperfine --prepare 'make clean' -P threads 1 8 'make -j {threads}'\n\n\
                      This performs benchmarks for 'make -j 1', 'make -j 2', …, 'make -j 8'.\n\n\
-                     To have the value increase following different patterns, use shell arithmetics.\n\n  \
-                     Example: hyperfine -P size 0 3 'sleep $((2**{size}))'\n\n\
+                     To have the value increase following different patterns, use shell arithmetic.\n\n  \
+                     Example: hyperfine --shell=bash -P size 0 3 'sleep $((2**{size}))'\n\n\
                      This performs benchmarks with power of 2 increases: 'sleep 1', 'sleep 2', 'sleep 4', …\n\
                      The exact syntax may vary depending on your shell and OS."
                 ),
@@ -133,12 +237,12 @@ fn build_command() -> Command<'static> {
             Arg::new("parameter-step-size")
                 .long("parameter-step-size")
                 .short('D')
-                .takes_value(true)
-                .value_names(&["DELTA"])
+                .action(ArgAction::Set)
+                .value_names(["DELTA"])
                 .requires("parameter-scan")
                 .help(
                     "This argument requires --parameter-scan to be specified as well. \
-                     Traverse the range MIN..MAX in steps of DELTA.\n\n  \
+                     Traverse the range MIN..MAX in steps of DELTA, which must be positive.\n\n  \
                      Example:  hyperfine -P delay 0.3 0.7 -D 0.2 'sleep {delay}'\n\n\
                      This performs benchmarks for 'sleep 0.3', 'sleep 0.5' and 'sleep 0.7'.",
                 ),
@@ -147,26 +251,69 @@ fn build_command() -> Command<'static> {
             Arg::new("parameter-list")
                 .long("parameter-list")
                 .short('L')
-                .takes_value(true)
-                .multiple_occurrences(true)
+                .action(ArgAction::Append)
                 .allow_hyphen_values(true)
-                .value_names(&["VAR", "VALUES"])
-                .conflicts_with_all(&["parameter-scan", "parameter-step-size"])
+                .value_names(["VAR", "VALUES"])
+                .conflicts_with_all(["parameter-scan", "parameter-step-size"])
                 .help(
                     "Perform benchmark runs for each value in the comma-separated list VALUES. \
                      Replaces the string '{VAR}' in each command by the current parameter value\
-                     .\n\nExample:  hyperfine -L compiler gcc,clang '{compiler} -O2 main.cpp'\n\n\
-                     This performs benchmarks for 'gcc -O2 main.cpp' and 'clang -O2 main.cpp'.\n\n\
+                     .\n\nExample:  hyperfine -L compiler g++,clang++ '{compiler} -O2 main.cpp'\n\n\
+                     This performs benchmarks for 'g++ -O2 main.cpp' and 'clang++ -O2 main.cpp'.\n\n\
                      The option can be specified multiple times to run benchmarks for all \
                      possible parameter combinations.\n"
                 ),
         )
         .arg(
+            Arg::new("shell")
+                .long("shell")
+                .action(ArgAction::Set)
+                .value_name("SHELL")
+                .overrides_with("shell")
+                .value_hint(ValueHint::CommandString)
+                .help("Set the shell to use for executing benchmarked commands, including warmup runs \
+                       (default: none). This can be the name or the path to the shell executable, or a full command line \
+                       like \"bash --norc\". It can also be set to \"default\" to explicitly select \
+                       the platform shell (sh on Unix, cmd.exe on Windows). It can also be set to \
+                       \"none\" to disable the shell. In this case, benchmarked commands will be executed \
+                       directly. They can still have arguments, but more complex things like \
+                       \"sleep 0.1; sleep 0.2\" are not possible without a shell. Setup, prepare, conclude, \
+                       and cleanup commands always use a shell: the selected shell, or the platform \
+                       shell when this option is omitted or set to \"none\".")
+        )
+        .arg(
+            Arg::new("default-shell")
+                .short('S')
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["shell", "no-shell", "debug-mode"])
+                .help("An alias for '--shell=default' (sh on Unix, cmd.exe on Windows).")
+        )
+        .arg(
+            Arg::new("no-shell")
+                .short('N')
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["shell", "debug-mode"])
+                .help("An alias for '--shell=none'.")
+        )
+        .arg(
+            Arg::new("ignore-failure")
+                .long("ignore-failure")
+                .action(ArgAction::Set)
+                .value_name("MODE")
+                .num_args(0..=1)
+                .default_missing_value("all-non-zero")
+                .require_equals(true)
+                .short('i')
+                .help("Ignore failures of the benchmarked programs. Without a value or with \
+                       'all-non-zero', all non-zero exit codes are ignored. You can also provide \
+                       a comma-separated list of exit codes to ignore (e.g., --ignore-failure=1,2)."),
+        )
+        .arg(
             Arg::new("style")
                 .long("style")
-                .takes_value(true)
+                .action(ArgAction::Set)
                 .value_name("TYPE")
-                .possible_values(&["auto", "basic", "full", "nocolor", "color", "none"])
+                .value_parser(["auto", "basic", "full", "nocolor", "color", "none"])
                 .help(
                     "Set output style type (default: auto). Set this to 'basic' to disable output \
                      coloring and interactive elements. Set it to 'full' to enable all effects \
@@ -177,87 +324,56 @@ fn build_command() -> Command<'static> {
                 ),
         )
         .arg(
-            Arg::new("shell")
-                .long("shell")
-                .short('S')
-                .takes_value(true)
-                .value_name("SHELL")
-                .overrides_with("shell")
-                .help("Set the shell to use for executing benchmarked commands. This can be the \
-                       name or the path to the shell executable, or a full command line \
-                       like \"bash --norc\". It can also be set to \"default\" to explicitly select \
-                       the default shell on this platform. Finally, this can also be set to \
-                       \"none\" to disable the shell. In this case, commands will be executed \
-                       directly. They can still have arguments, but more complex things like \
-                       \"sleep 0.1; sleep 0.2\" are not possible without a shell.")
-        )
-        .arg(
-            Arg::new("no-shell")
-                .short('N')
-                .conflicts_with_all(&["shell", "debug-mode"])
-                .help("An alias for '--shell=none'.")
-        )
-        .arg(
-            Arg::new("ignore-failure")
-                .long("ignore-failure")
-                .short('i')
-                .help("Ignore non-zero exit codes of the benchmarked programs."),
-        )
-        .arg(
-            Arg::new("time-unit")
-                .long("time-unit")
-                .short('u')
-                .takes_value(true)
-                .value_name("UNIT")
-                .possible_values(&["millisecond", "second"])
-                .help("Set the time unit to be used. Possible values: millisecond, second. \
-                       If the option is not given, the time unit is determined automatically. \
-                       This option affects the standard output as well as all export formats except for CSV and JSON."),
-        )
-        .arg(
             Arg::new("export-asciidoc")
                 .long("export-asciidoc")
-                .takes_value(true)
+                .action(ArgAction::Set)
                 .value_name("FILE")
-                .help("Export the timing summary statistics as an AsciiDoc table to the given FILE. \
-                       The output time unit can be changed using the --time-unit option."),
+                .value_hint(ValueHint::FilePath)
+                .help("Export the primary metric summary statistics as an AsciiDoc table to the given FILE. \
+                       The unit can be set with --metrics METRIC:UNIT."),
         )
         .arg(
             Arg::new("export-csv")
                 .long("export-csv")
-                .takes_value(true)
+                .action(ArgAction::Set)
                 .value_name("FILE")
-                .help("Export the timing summary statistics as CSV to the given FILE. If you need \
-                       the timing results for each individual run, use the JSON export format. \
-                       The output time unit is always seconds."),
+                .value_hint(ValueHint::FilePath)
+                .help("Export summary statistics for all selected metrics as CSV to the given FILE. If you need \
+                       all metrics for each individual run, use the JSON export format. \
+                       Column names are prefixed with the metric name. \
+                       Use the explicitly selected units, or base units when unspecified."),
         )
         .arg(
             Arg::new("export-json")
                 .long("export-json")
-                .takes_value(true)
+                .action(ArgAction::Set)
                 .value_name("FILE")
-                .help("Export the timing summary statistics and timings of individual runs as JSON to the given FILE. \
-                       The output time unit is always seconds"),
+                .value_hint(ValueHint::FilePath)
+                .help("Export all collected metrics and individual runs as JSON to the given FILE. \
+                       Values always use base units (seconds, bytes, counts)."),
         )
         .arg(
             Arg::new("export-markdown")
                 .long("export-markdown")
-                .takes_value(true)
+                .action(ArgAction::Set)
                 .value_name("FILE")
-                .help("Export the timing summary statistics as a Markdown table to the given FILE. \
-                       The output time unit can be changed using the --time-unit option."),
+                .value_hint(ValueHint::FilePath)
+                .help("Export the primary metric summary statistics as a Markdown table to the given FILE. \
+                       The unit can be set with --metrics METRIC:UNIT."),
         )
         .arg(
             Arg::new("export-orgmode")
                 .long("export-orgmode")
-                .takes_value(true)
+                .action(ArgAction::Set)
                 .value_name("FILE")
-                .help("Export the timing summary statistics as a Emacs org-mode table to the given FILE. \
-                       The output time unit can be changed using the --time-unit option."),
+                .value_hint(ValueHint::FilePath)
+                .help("Export the primary metric summary statistics as an Emacs org-mode table to the given FILE. \
+                       The unit can be set with --metrics METRIC:UNIT."),
         )
         .arg(
             Arg::new("show-output")
                 .long("show-output")
+                .action(ArgAction::SetTrue)
                 .conflicts_with("style")
                 .help(
                     "Print the stdout and stderr of the benchmark instead of suppressing it. \
@@ -270,26 +386,49 @@ fn build_command() -> Command<'static> {
             Arg::new("output")
                 .long("output")
                 .conflicts_with("show-output")
-                .takes_value(true)
+                .action(ArgAction::Append)
                 .value_name("WHERE")
                 .help(
-                    "Control where the output of the benchmark is redirected. <WHERE> can be:\n\n\
-                     null: Redirect output to /dev/null (the default). \
-                     Note that some programs like 'grep' detect when standard output is /dev/null \
-                     and apply certain optimizations. To avoid that, consider using \
-                     '--output=pipe'.\n\n\
-                     pipe: Feed the output through a pipe before discarding it.\n\n\
-                     inherit: Don't redirect the output at all (same as '--show-output').\n\n\
-                     <FILE>: Write the output to the given file.",
+                    "Control where the output of the benchmark is redirected. Note \
+                     that some programs like 'grep' detect when standard output is \
+                     /dev/null and apply certain optimizations. To avoid that, consider \
+                     using '--output=pipe'.\n\
+                     \n\
+                     <WHERE> can be:\n\
+                     \n  \
+                       null:     Redirect output to /dev/null (the default).\n\
+                     \n  \
+                       pipe:     Feed the output through a pipe before discarding it.\n\
+                     \n  \
+                       inherit:  Don't redirect the output at all (same as '--show-output').\n\
+                     \n  \
+                       <FILE>:   Write the output to the given file.\n\n\
+                    This option can be specified once for all commands or multiple times, once for \
+                    each command. Note: If you want to log the output of each and every iteration, \
+                    you can use a shell redirection and the '$HYPERFINE_ITERATION' environment variable:\n    \
+                    hyperfine -S 'my-command > output-${HYPERFINE_ITERATION}.log'\n\n",
                 ),
+        )
+        .arg(
+            Arg::new("input")
+                .long("input")
+                .action(ArgAction::Set)
+                .num_args(1)
+                .value_name("WHERE")
+                .help("Control where the input of the benchmark comes from.\n\
+                       \n\
+                       <WHERE> can be:\n\
+                       \n  \
+                         null:     Read from /dev/null (the default).\n\
+                       \n  \
+                         <FILE>:   Read the input from the given file."),
         )
         .arg(
             Arg::new("command-name")
                 .long("command-name")
                 .short('n')
-                .takes_value(true)
-                .multiple_occurrences(true)
-                .number_of_values(1)
+                .action(ArgAction::Append)
+                .num_args(1)
                 .value_name("NAME")
                 .help("Give a meaningful name to a command. This can be specified multiple times \
                        if several commands are benchmarked."),
@@ -299,7 +438,7 @@ fn build_command() -> Command<'static> {
         .arg(
             Arg::new("min-benchmarking-time")
             .long("min-benchmarking-time")
-            .takes_value(true)
+            .action(ArgAction::Set)
             .hide(true)
             .help("Set the minimum time (in seconds) to run benchmarks. Note that the number of \
                    benchmark runs is additionally influenced by the `--min-runs`, `--max-runs`, and \
@@ -308,6 +447,7 @@ fn build_command() -> Command<'static> {
         .arg(
             Arg::new("debug-mode")
             .long("debug-mode")
+            .action(ArgAction::SetTrue)
             .hide(true)
             .help("Enable debug mode which does not actually run commands, but returns fake times when the command is 'sleep <time>'.")
         )

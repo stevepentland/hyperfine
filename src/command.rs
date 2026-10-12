@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
+use crate::parameter::tokenize::tokenize;
+use crate::parameter::ParameterValue;
 use crate::{
     error::{OptionsError, ParameterScanError},
     parameter::{
@@ -10,14 +12,12 @@ use crate::{
     },
 };
 
-use clap::ArgMatches;
+use clap::{parser::ValuesRef, ArgMatches};
 
-use crate::parameter::tokenize::tokenize;
-use crate::parameter::ParameterValue;
-
-use anyhow::{bail, Context, Result};
-use clap::Values;
+use anyhow::{bail, ensure, Context, Result};
 use rust_decimal::Decimal;
+
+type Environment = Vec<(String, String)>;
 
 /// A command that should be benchmarked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +30,9 @@ pub struct Command<'a> {
 
     /// Zero or more parameter values.
     parameters: Vec<ParameterNameAndValue<'a>>,
+
+    /// Environment overrides, before parameter substitution.
+    environment: Environment,
 }
 
 impl<'a> Command<'a> {
@@ -38,6 +41,7 @@ impl<'a> Command<'a> {
             name,
             expression,
             parameters: Vec::new(),
+            environment: Vec::new(),
         }
     }
 
@@ -50,14 +54,42 @@ impl<'a> Command<'a> {
             name,
             expression,
             parameters: parameters.into_iter().collect(),
+            environment: Vec::new(),
         }
     }
 
     pub fn get_name(&self) -> String {
-        self.name.map_or_else(
-            || self.get_command_line(),
-            |name| self.replace_parameters_in(name),
-        )
+        match self.name {
+            Some(name) => self.replace_parameters_in(name),
+            None => {
+                let environment = self
+                    .get_environment()
+                    .map(|(name, value)| format!("{name}={}", shell_words::quote(&value)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if environment.is_empty() {
+                    self.get_command_line()
+                } else {
+                    format!("{environment} {}", self.get_command_line())
+                }
+            }
+        }
+    }
+
+    pub fn get_name_with_unused_parameters(&self) -> String {
+        let parameters = self
+            .get_unused_parameters()
+            .fold(String::new(), |output, (parameter, value)| {
+                output + &format!("{parameter} = {value}, ")
+            });
+        let parameters = parameters.trim_end_matches(", ");
+        let parameters = if parameters.is_empty() {
+            "".into()
+        } else {
+            format!(" ({parameters})")
+        };
+
+        format!("{}{}", self.get_name(), parameters)
     }
 
     pub fn get_command_line(&self) -> String {
@@ -67,12 +99,13 @@ impl<'a> Command<'a> {
     pub fn get_command(&self) -> Result<std::process::Command> {
         let command_line = self.get_command_line();
         let mut tokens = shell_words::split(&command_line)
-            .with_context(|| format!("Failed to parse command '{}'", command_line))?
+            .with_context(|| format!("Failed to parse command '{command_line}'"))?
             .into_iter();
 
         if let Some(program_name) = tokens.next() {
             let mut command_builder = std::process::Command::new(program_name);
             command_builder.args(tokens);
+            command_builder.envs(self.get_environment());
             Ok(command_builder)
         } else {
             bail!("Can not execute empty command")
@@ -83,14 +116,37 @@ impl<'a> Command<'a> {
         &self.parameters
     }
 
+    pub fn get_environment(&self) -> impl Iterator<Item = (&str, String)> {
+        self.environment
+            .iter()
+            .map(move |(name, value)| (name.as_str(), self.replace_parameters_in(value)))
+    }
+
+    pub fn with_environment_from(mut self, command: &Command<'_>) -> Self {
+        self.environment = command.environment.clone();
+        self
+    }
+
+    pub fn is_parameter_unused(&self, parameter: &str) -> bool {
+        let placeholder = format!("{{{parameter}}}");
+        !self.expression.contains(&placeholder)
+            && !self
+                .environment
+                .iter()
+                .any(|(_, value)| value.contains(&placeholder))
+    }
+
+    pub fn get_unused_parameters(&self) -> impl Iterator<Item = &(&'a str, ParameterValue)> {
+        self.parameters
+            .iter()
+            .filter(move |(parameter, _)| self.is_parameter_unused(parameter))
+    }
+
     fn replace_parameters_in(&self, original: &str) -> String {
         let mut result = String::new();
         let mut replacements = BTreeMap::<String, String>::new();
         for (param_name, param_value) in &self.parameters {
-            replacements.insert(
-                format!("{{{param_name}}}", param_name = param_name),
-                param_value.to_string(),
-            );
+            replacements.insert(format!("{{{param_name}}}"), param_value.to_string());
         }
         let mut remaining = original;
         // Manually replace consecutive occurrences to avoid double-replacing: e.g.,
@@ -116,25 +172,84 @@ impl<'a> Command<'a> {
 /// A collection of commands that should be benchmarked
 pub struct Commands<'a>(Vec<Command<'a>>);
 
-impl<'a> Commands<'a> {
-    pub fn from_cli_arguments(matches: &'a ArgMatches) -> Result<Commands> {
-        let command_names = matches.values_of("command-name");
-        let command_strings = matches.values_of("command").unwrap();
+fn parse_environment(value: &str) -> Result<Environment> {
+    let mut environment = Environment::new();
+    for assignment in shell_words::split(value).context("Failed to parse '--env' assignments")? {
+        let (name, value) = assignment.split_once('=').with_context(|| {
+            format!(
+                "Invalid value '{assignment}' for '--env': expected an assignment like NAME=value or NAME=\"quoted value\"."
+            )
+        })?;
+        ensure!(
+            !name.is_empty()
+                && name.bytes().enumerate().all(|(index, byte)| {
+                    byte == b'_'
+                        || byte.is_ascii_alphabetic()
+                        || (index > 0 && byte.is_ascii_digit())
+                }),
+            "Invalid environment variable name '{name}' in '--env'"
+        );
+        // Keep only the last assignment, including case variants on Windows.
+        environment.retain(|(key, _)| {
+            if cfg!(windows) {
+                !key.eq_ignore_ascii_case(name)
+            } else {
+                key != name
+            }
+        });
+        environment.push((name.to_owned(), value.to_owned()));
+    }
+    Ok(environment)
+}
 
-        if let Some(args) = matches.values_of("parameter-scan") {
-            let step_size = matches.value_of("parameter-step-size");
+impl<'a> Commands<'a> {
+    pub fn from_cli_arguments(matches: &'a ArgMatches) -> Result<Commands<'a>> {
+        let mut commands = Self::build_from_cli_arguments(matches)?;
+        if let Some(values) = matches.get_many::<String>("env") {
+            let environments = values
+                .map(|value| parse_environment(value))
+                .collect::<Result<Vec<_>>>()?;
+            let num_commands = commands.num_commands();
+            ensure!(
+                environments.len() == 1 || environments.len() == num_commands,
+                "The '--env' option has to be provided just once or N times, where N={num_commands} is the \
+                 number of benchmark commands."
+            );
+            for (index, command) in commands.0.iter_mut().enumerate() {
+                command.environment =
+                    environments[if environments.len() == 1 { 0 } else { index }].clone();
+            }
+        }
+        Ok(commands)
+    }
+
+    fn build_from_cli_arguments(matches: &'a ArgMatches) -> Result<Commands<'a>> {
+        let command_names = matches.get_many::<String>("command-name");
+        let command_strings = matches
+            .get_many::<String>("command")
+            .unwrap_or_default()
+            .map(|v| v.as_str())
+            .collect::<Vec<_>>();
+
+        if let Some(args) = matches.get_many::<String>("parameter-scan") {
+            let step_size = matches
+                .get_one::<String>("parameter-step-size")
+                .map(|s| s.as_str());
             Ok(Self(Self::get_parameter_scan_commands(
                 command_names,
                 command_strings,
                 args,
                 step_size,
             )?))
-        } else if let Some(args) = matches.values_of("parameter-list") {
-            let command_names = command_names.map_or(vec![], |names| names.collect::<Vec<&str>>());
-
-            let args: Vec<_> = args.collect();
+        } else if let Some(args) = matches.get_many::<String>("parameter-list") {
+            let command_names = command_names.map_or(vec![], |names| {
+                names.map(|v| v.as_str()).collect::<Vec<_>>()
+            });
+            let args: Vec<_> = args.map(|v| v.as_str()).collect::<Vec<_>>();
             let param_names_and_values: Vec<(&str, Vec<String>)> = args
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     let name = pair[0];
                     let list_str = pair[1];
@@ -145,12 +260,11 @@ impl<'a> Commands<'a> {
                 let duplicates =
                     Self::find_duplicates(param_names_and_values.iter().map(|(name, _)| *name));
                 if !duplicates.is_empty() {
-                    bail!("Duplicate parameter names: {}", &duplicates.join(", "));
+                    bail!("Duplicate parameter names: {}", duplicates.join(", "));
                 }
             }
-            let command_list = command_strings.collect::<Vec<&str>>();
 
-            let dimensions: Vec<usize> = std::iter::once(command_list.len())
+            let dimensions: Vec<usize> = std::iter::once(command_strings.len())
                 .chain(
                     param_names_and_values
                         .iter()
@@ -191,7 +305,7 @@ impl<'a> Commands<'a> {
                     .collect();
                 commands.push(Command::new_parametrized(
                     name,
-                    command_list[*command_index],
+                    command_strings[*command_index],
                     parameters,
                 ));
 
@@ -209,14 +323,15 @@ impl<'a> Commands<'a> {
 
             Ok(Self(commands))
         } else {
-            let command_names = command_names.map_or(vec![], |names| names.collect::<Vec<&str>>());
+            let command_names = command_names.map_or(vec![], |names| {
+                names.map(|v| v.as_str()).collect::<Vec<_>>()
+            });
             if command_names.len() > command_strings.len() {
                 return Err(OptionsError::TooManyCommandNames(command_strings.len()).into());
             }
 
-            let command_list = command_strings.collect::<Vec<&str>>();
-            let mut commands = Vec::with_capacity(command_list.len());
-            for (i, s) in command_list.iter().enumerate() {
+            let mut commands = Vec::with_capacity(command_strings.len());
+            for (i, s) in command_strings.iter().enumerate() {
                 commands.push(Command::new(command_names.get(i).copied(), s));
             }
             Ok(Self(commands))
@@ -253,17 +368,7 @@ impl<'a> Commands<'a> {
         command_strings: Vec<&'b str>,
     ) -> Result<Vec<Command<'b>>, ParameterScanError> {
         let param_range = RangeStep::new(param_min, param_max, step)?;
-        let param_count = param_range.size_hint().1.unwrap();
         let command_name_count = command_names.len();
-
-        // `--command-name` should appear exactly once or exactly B times,
-        // where B is the total number of benchmarks.
-        if command_name_count > 1 && command_name_count != param_count {
-            return Err(ParameterScanError::UnexpectedCommandNameCount(
-                command_name_count,
-                param_count,
-            ));
-        }
 
         let mut i = 0;
         let mut commands = vec![];
@@ -281,20 +386,32 @@ impl<'a> Commands<'a> {
                 i += 1;
             }
         }
+
+        // `--command-name` should appear exactly once or exactly B times,
+        // where B is the total number of benchmarks.
+        let command_count = commands.len();
+        if command_name_count > 1 && command_name_count != command_count {
+            return Err(ParameterScanError::UnexpectedCommandNameCount(
+                command_name_count,
+                command_count,
+            ));
+        }
+
         Ok(commands)
     }
 
     fn get_parameter_scan_commands<'b>(
-        command_names: Option<Values<'b>>,
-        command_strings: Values<'b>,
-        mut vals: clap::Values<'b>,
+        command_names: Option<ValuesRef<'b, String>>,
+        command_strings: Vec<&'b str>,
+        mut vals: ValuesRef<'b, String>,
         step: Option<&str>,
     ) -> Result<Vec<Command<'b>>, ParameterScanError> {
-        let command_names = command_names.map_or(vec![], |names| names.collect::<Vec<&str>>());
-        let command_strings = command_strings.collect::<Vec<&str>>();
-        let param_name = vals.next().unwrap();
-        let param_min = vals.next().unwrap();
-        let param_max = vals.next().unwrap();
+        let command_names = command_names.map_or(vec![], |names| {
+            names.map(|v| v.as_str()).collect::<Vec<_>>()
+        });
+        let param_name = vals.next().unwrap().as_str();
+        let param_min = vals.next().unwrap().as_str();
+        let param_max = vals.next().unwrap().as_str();
 
         // attempt to parse as integers
         if let (Ok(param_min), Ok(param_max), Ok(step)) = (
@@ -358,7 +475,7 @@ fn test_get_parameterized_command_name() {
     assert_eq!(cmd.get_name(), "name-quux-baz");
 }
 
-impl<'a> fmt::Display for Command<'a> {
+impl fmt::Display for Command<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.get_command_line())
     }
@@ -444,6 +561,40 @@ fn test_build_parameter_scan_commands() {
     assert_eq!(commands[1].get_name(), "name-2");
     assert_eq!(commands[0].get_command_line(), "echo 1");
     assert_eq!(commands[1].get_command_line(), "echo 2");
+}
+
+#[test]
+fn test_build_parameter_scan_commands_named() {
+    use crate::cli::get_cli_arguments;
+    let matches = get_cli_arguments(vec![
+        "hyperfine",
+        "echo {val}",
+        "sleep {val}",
+        "--parameter-scan",
+        "val",
+        "1",
+        "2",
+        "--parameter-step-size",
+        "1",
+        "--command-name",
+        "echo-1",
+        "--command-name",
+        "sleep-1",
+        "--command-name",
+        "echo-2",
+        "--command-name",
+        "sleep-2",
+    ]);
+    let commands = Commands::from_cli_arguments(&matches).unwrap().0;
+    assert_eq!(commands.len(), 4);
+    assert_eq!(commands[0].get_name(), "echo-1");
+    assert_eq!(commands[0].get_command_line(), "echo 1");
+    assert_eq!(commands[1].get_name(), "sleep-1");
+    assert_eq!(commands[1].get_command_line(), "sleep 1");
+    assert_eq!(commands[2].get_name(), "echo-2");
+    assert_eq!(commands[2].get_command_line(), "echo 2");
+    assert_eq!(commands[3].get_name(), "sleep-2");
+    assert_eq!(commands[3].get_command_line(), "sleep 2");
 }
 
 #[test]

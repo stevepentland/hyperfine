@@ -1,12 +1,10 @@
-use colored::*;
-
 use super::benchmark_result::BenchmarkResult;
 use super::executor::{Executor, MockExecutor, RawExecutor, ShellExecutor};
-use super::{relative_speed, Benchmark};
+use super::Benchmark;
 
 use crate::command::Commands;
 use crate::export::ExportManager;
-use crate::options::{ExecutorKind, Options, OutputStyleOption};
+use crate::options::{ExecutorKind, Options};
 
 use anyhow::Result;
 
@@ -41,57 +39,118 @@ impl<'a> Scheduler<'a> {
         executor.calibrate()?;
 
         for (number, cmd) in self.commands.iter().enumerate() {
-            self.results
-                .push(Benchmark::new(number, cmd, self.options, &*executor).run()?);
+            self.results.push(
+                Benchmark::new(number, cmd, self.options, &*executor).run(self.results.first())?,
+            );
 
-            // We export (all results so far) after each individual benchmark, because
-            // we would risk losing all results if a later benchmark fails.
-            self.export_manager
-                .write_results(&self.results, self.options.time_unit)?;
+            // We export results after each individual benchmark, because
+            // we would risk losing them if a later benchmark fails.
+            self.export_manager.write_results(&self.results, true)?;
         }
 
         Ok(())
     }
 
-    pub fn print_relative_speed_comparison(&self) {
-        if self.options.output_style == OutputStyleOption::Disabled {
-            return;
-        }
-
-        if self.results.len() < 2 {
-            return;
-        }
-
-        if let Some(mut annotated_results) = relative_speed::compute(&self.results) {
-            annotated_results.sort_by(|l, r| relative_speed::compare_mean_time(l.result, r.result));
-
-            let fastest = &annotated_results[0];
-            let others = &annotated_results[1..];
-
-            println!("{}", "Summary".bold());
-            println!("  '{}' ran", fastest.result.command.cyan());
-
-            for item in others {
-                println!(
-                    "{}{} times faster than '{}'",
-                    format!("{:8.2}", item.relative_speed).bold().green(),
-                    if let Some(stddev) = item.relative_speed_stddev {
-                        format!(" ± {}", format!("{:.2}", stddev).green())
-                    } else {
-                        "".into()
-                    },
-                    &item.result.command.magenta()
-                );
-            }
-        } else {
-            eprintln!(
-                "{}: The benchmark comparison could not be computed as some benchmark times are zero. \
-                 This could be caused by background interference during the initial calibration phase \
-                 of hyperfine, in combination with very fast commands (faster than a few milliseconds). \
-                 Try to re-run the benchmark on a quiet system. If it does not help, you command is \
-                 most likely too fast to be accurately benchmarked by hyperfine.",
-                 "Note".bold().red()
-            );
-        }
+    pub fn final_export(&self) -> Result<()> {
+        self.export_manager.write_results(&self.results, false)
     }
+}
+
+#[cfg(test)]
+fn generate_results(args: &[&'static str]) -> Result<Vec<BenchmarkResult>> {
+    use crate::cli::get_cli_arguments;
+
+    let args = ["hyperfine", "--debug-mode", "--style=none"]
+        .iter()
+        .chain(args);
+    let cli_arguments = get_cli_arguments(args);
+    let mut options = Options::from_cli_arguments(&cli_arguments)?;
+
+    assert_eq!(options.executor_kind, ExecutorKind::Mock(None));
+
+    let commands = Commands::from_cli_arguments(&cli_arguments)?;
+    let export_manager = ExportManager::from_cli_arguments(&cli_arguments, &options.metrics)?;
+
+    options.validate_against_command_list(&commands)?;
+
+    let mut scheduler = Scheduler::new(&commands, &options, &export_manager);
+
+    scheduler.run_benchmarks()?;
+    Ok(scheduler.results)
+}
+
+#[test]
+fn scheduler_basic() -> Result<()> {
+    insta::assert_yaml_snapshot!(generate_results(&["--runs=2", "sleep 0.123", "sleep 0.456"])?, @"
+    - command: sleep 0.123
+      measurements:
+        - time_wall_clock:
+            value: 0.123
+            unit: second
+          time_cpu:
+            value: 0
+            unit: second
+          time_user:
+            value: 0
+            unit: second
+          time_system:
+            value: 0
+            unit: second
+          memory_peak_resident:
+            value: 0
+            unit: byte
+          exit_code: 0
+        - time_wall_clock:
+            value: 0.123
+            unit: second
+          time_cpu:
+            value: 0
+            unit: second
+          time_user:
+            value: 0
+            unit: second
+          time_system:
+            value: 0
+            unit: second
+          memory_peak_resident:
+            value: 0
+            unit: byte
+          exit_code: 0
+    - command: sleep 0.456
+      measurements:
+        - time_wall_clock:
+            value: 0.456
+            unit: second
+          time_cpu:
+            value: 0
+            unit: second
+          time_user:
+            value: 0
+            unit: second
+          time_system:
+            value: 0
+            unit: second
+          memory_peak_resident:
+            value: 0
+            unit: byte
+          exit_code: 0
+        - time_wall_clock:
+            value: 0.456
+            unit: second
+          time_cpu:
+            value: 0
+            unit: second
+          time_user:
+            value: 0
+            unit: second
+          time_system:
+            value: 0
+            unit: second
+          memory_peak_resident:
+            value: 0
+            unit: byte
+          exit_code: 0
+    ");
+
+    Ok(())
 }
